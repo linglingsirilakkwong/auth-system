@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException, Request, Form, Depends, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 import uvicorn
+import os
 
 app = FastAPI(title="授权管理中心")
 DB_FILE = "users.db"
@@ -174,9 +175,10 @@ def verify_run(req: RunCheck):
 
 # ================= 可视化管理员后台 (修改前缀为 /secure/admin) =================
 
-ADMIN_USER = "admin"
-ADMIN_PWD = "admin888"
-SESSION_TOKEN = "secret_admin_token_2026"
+# 从环境变量中读取，如果读取不到则使用后面的默认值
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PWD = os.environ.get("ADMIN_PWD", "默认的一个超级复杂随机密码防止漏刷")
+SESSION_TOKEN = os.environ.get("SESSION_TOKEN", "secure_token_random_2026")
 
 
 def get_login_page(error_msg=""):
@@ -307,7 +309,6 @@ def admin_action(target_user: str = Form(...), action: str = Form(...), days: in
 
 
 if __name__ == "__main__":
-    import os
     # 自动获取云服务器分配的端口，找不到则默认 14283
     port = int(os.environ.get("PORT", 14283))
     print("启动服务器中...")
