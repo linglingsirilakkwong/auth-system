@@ -1,32 +1,57 @@
-import sqlite3
+import os
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, Request, Form, Depends, Response
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 import uvicorn
-import os
+
+# 引入 psycopg2 用于连接 PostgreSQL 云数据库
+import psycopg2
 
 app = FastAPI(title="授权管理中心")
-DB_FILE = "users.db"
+
+# ================= 环境变量配置 =================
+# 1. 核心安全：从环境变中读取管理端凭证
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PWD = os.environ.get("ADMIN_PWD", "默认的一个超级复杂随机密码防止漏刷")
+SESSION_TOKEN = os.environ.get("SESSION_TOKEN", "secure_token_random_2026")
+
+# 2. 云数据库连接串：从环境中读取 Supabase URI 链接
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
-# ================= 数据库初始化 =================
+# ================= 数据库初始化与核心连接 =================
+def get_db_connection():
+    if not DATABASE_URL:
+        raise ValueError(
+            "⚠️ 致命错误: 环境变量 'DATABASE_URL' 未配置！请在 Render 控制台正确填写 Supabase 数据库连接字符串。"
+        )
+    # 创建数据库连接并开启自动提交（等同于 sqlite 的实时 conn.commit()）
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = True
+    return conn
+
+
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute('''
+    # 针对 PostgreSQL 语法进行了微调：DATETIME 修改为更规范的 TIMESTAMP 类型
+    c.execute(
+        """
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
             password TEXT,
             mac_address TEXT,
             status TEXT DEFAULT 'pending',
-            expires_at DATETIME
+            expires_at TIMESTAMP
         )
-    ''')
-    conn.commit()
+    """
+    )
+    c.close()
     conn.close()
 
 
+# 服务启动时自动检查/创建云端数据表
 init_db()
 
 
@@ -97,88 +122,123 @@ def index_page():
 
 # ================= API 接口 (修改前缀为 /secure/api/) =================
 
+
 @app.post("/secure/api/register")
 def register_user(user: UserAuth):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     try:
-        c.execute("INSERT INTO users (username, password, mac_address, status) VALUES (?, ?, ?, 'pending')",
-                  (user.username, user.password, user.mac_address))
-        conn.commit()
-    except sqlite3.IntegrityError:
+        # PostgreSQL 的 SQL 占位符统一修改为 %s 而不是 sqlite3 的 ?
+        c.execute(
+            "INSERT INTO users (username, password, mac_address, status) VALUES (%s, %s, %s, 'pending')",
+            (user.username, user.password, user.mac_address),
+        )
+    except psycopg2.errors.UniqueViolation:
+        # 捕捉 PostgreSQL 独有的主键冲突/重复异常
+        c.close()
         conn.close()
         return {"status": "error", "message": "该账号已被注册！"}
-    conn.close()
-    return {"status": "success", "message": "注册成功！已提交授权请求，请等待管理员审批。"}
+    finally:
+        # 确保哪怕发生意料之外的错误也安全关闭游标
+        if not c.closed:
+            c.close()
+        conn.close()
+    return {
+        "status": "success",
+        "message": "注册成功！已提交授权请求，请等待管理员审批。",
+    }
 
 
 @app.post("/secure/api/login")
 def login_user(user: UserAuth):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT password, mac_address, status, expires_at FROM users WHERE username=?", (user.username,))
+    c.execute(
+        "SELECT password, mac_address, status, expires_at FROM users WHERE username=%s",
+        (user.username,),
+    )
     row = c.fetchone()
-    conn.close()
 
     if not row:
+        c.close()
+        conn.close()
         return {"status": "error", "message": "账号不存在，请先注册"}
 
-    db_pwd, db_mac, status, expires_str = row
+    db_pwd, db_mac, status, expires_dt = row
 
     if db_pwd != user.password:
+        c.close()
+        conn.close()
         return {"status": "error", "message": "密码错误！"}
 
     if db_mac != user.mac_address:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("UPDATE users SET mac_address=?, status='pending' WHERE username=?",
-                  (user.mac_address, user.username))
-        conn.commit()
+        # 设备变更时在云端执行更新
+        c.execute(
+            "UPDATE users SET mac_address=%s, status='pending' WHERE username=%s",
+            (user.mac_address, user.username),
+        )
+        c.close()
         conn.close()
-        return {"status": "error", "message": "检测到更换设备！已重新提交审批请求。"}
+        return {
+            "status": "error",
+            "message": "检测到更换设备！已重新提交审批请求。",
+        }
 
-    if status == 'pending':
+    c.close()
+    conn.close()
+
+    if status == "pending":
         return {"status": "error", "message": "账号正在等待管理员审批。"}
-    elif status == 'rejected':
+    elif status == "rejected":
         return {"status": "error", "message": "您的授权已被管理员拒绝。"}
 
-    if datetime.now() > datetime.fromisoformat(expires_str):
+    # 从 PostgreSQL 读取出的 TIMESTAMP 直接是 Python datetime 对象，无需 fromisoformat 转换
+    if expires_dt and datetime.now() > expires_dt:
         return {"status": "error", "message": "您的授权已过期。"}
 
-    return {"status": "success", "message": "登录成功", "expires_at": expires_str}
+    expires_str = expires_dt.isoformat() if expires_dt else "无"
+    return {
+        "status": "success",
+        "message": "登录成功",
+        "expires_at": expires_str,
+    }
 
 
 @app.post("/secure/api/verify_run")
 def verify_run(req: RunCheck):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT mac_address, status, expires_at FROM users WHERE username=?", (req.username,))
+    c.execute(
+        "SELECT mac_address, status, expires_at FROM users WHERE username=%s",
+        (req.username,),
+    )
     row = c.fetchone()
+    c.close()
     conn.close()
 
     if not row:
         return {"status": "error", "message": "账号已被彻底注销"}
 
-    db_mac, status, expires_str = row
+    db_mac, status, expires_dt = row
 
     if db_mac != req.mac_address:
         return {"status": "error", "message": "设备码不匹配"}
 
-    if status != 'approved':
+    if status != "approved":
         return {"status": "error", "message": "管理员已收回您的使用权限！"}
 
-    if datetime.now() > datetime.fromisoformat(expires_str):
+    if expires_dt and datetime.now() > expires_dt:
         return {"status": "error", "message": "授权已过期！"}
 
-    return {"status": "success", "message": "权限有效", "expires_at": expires_str}
+    expires_str = expires_dt.isoformat() if expires_dt else "无"
+    return {
+        "status": "success",
+        "message": "权限有效",
+        "expires_at": expires_str,
+    }
 
 
 # ================= 可视化管理员后台 (修改前缀为 /secure/admin) =================
-
-# 从环境变量中读取，如果读取不到则使用后面的默认值
-ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-ADMIN_PWD = os.environ.get("ADMIN_PWD", "默认的一个超级复杂随机密码防止漏刷")
-SESSION_TOKEN = os.environ.get("SESSION_TOKEN", "secure_token_random_2026")
 
 
 def get_login_page(error_msg=""):
@@ -204,9 +264,13 @@ def get_login_page(error_msg=""):
 @app.post("/secure/admin/login")
 def admin_login(username: str = Form(...), password: str = Form(...)):
     if username == ADMIN_USER and password == ADMIN_PWD:
-        # 修改：重定向到 /secure/admin
         response = RedirectResponse(url="/secure/admin", status_code=303)
-        response.set_cookie(key="admin_session", value=SESSION_TOKEN, max_age=7200, httponly=True)
+        response.set_cookie(
+            key="admin_session",
+            value=SESSION_TOKEN,
+            max_age=7200,
+            httponly=True,
+        )
         return response
     else:
         return HTMLResponse(get_login_page("账号或密码错误！"))
@@ -214,7 +278,6 @@ def admin_login(username: str = Form(...), password: str = Form(...)):
 
 @app.get("/secure/admin/logout")
 def admin_logout():
-    # 修改：重定向回首页
     response = RedirectResponse(url="/secure", status_code=303)
     response.delete_cookie(key="admin_session")
     return response
@@ -233,19 +296,26 @@ def admin_dashboard(request: Request):
     if not session or session != SESSION_TOKEN:
         return HTMLResponse(get_login_page())
 
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT username, mac_address, status, expires_at FROM users ORDER BY status DESC")
+    c.execute(
+        "SELECT username, mac_address, status, expires_at FROM users ORDER BY status DESC"
+    )
     users = c.fetchall()
+    c.close()
     conn.close()
 
     rows_html = ""
     for u in users:
-        uname, mac, status, exp = u
-        exp_text = exp[:16] if exp else "无"
-        status_color = "orange" if status == 'pending' else "green" if status == 'approved' else "red"
+        uname, mac, status, exp_dt = u
+        # 安全转换展示格式
+        exp_text = exp_dt.strftime("%Y-%m-%d %H:%M") if exp_dt else "无"
+        status_color = (
+            "orange"
+            if status == "pending"
+            else "green" if status == "approved" else "red"
+        )
 
-        # 修改：表单 action 为 /secure/admin/action
         rows_html += f"""
         <tr onmouseover="this.style.backgroundColor='#f1f3f4'" onmouseout="this.style.backgroundColor='transparent'">
             <td>{uname}</td><td style='font-family: monospace; color: #555; font-size: 12px;'>{mac}</td>
@@ -288,28 +358,37 @@ def admin_dashboard(request: Request):
 
 
 @app.post("/secure/admin/action")
-def admin_action(target_user: str = Form(...), action: str = Form(...), days: int = Form(30),
-                 _=Depends(check_admin_auth)):
-    conn = sqlite3.connect(DB_FILE)
+def admin_action(
+    target_user: str = Form(...),
+    action: str = Form(...),
+    days: int = Form(30),
+    _=Depends(check_admin_auth),
+):
+    conn = get_db_connection()
     c = conn.cursor()
 
     if action == "approve":
-        expires_at = (datetime.now() + timedelta(days=days)).isoformat()
-        c.execute("UPDATE users SET status='approved', expires_at=? WHERE username=?", (expires_at, target_user))
+        # 针对 PostgreSQL 的 TIMESTAMP，直接传入 Python 的 datetime 对象作为参数，比字符串更安全
+        expires_at = datetime.now() + timedelta(days=days)
+        c.execute(
+            "UPDATE users SET status='approved', expires_at=%s WHERE username=%s",
+            (expires_at, target_user),
+        )
     elif action == "reject":
-        c.execute("UPDATE users SET status='rejected' WHERE username=?", (target_user,))
+        c.execute(
+            "UPDATE users SET status='rejected' WHERE username=%s",
+            (target_user,),
+        )
     elif action == "delete":
-        c.execute("DELETE FROM users WHERE username=?", (target_user,))
+        c.execute("DELETE FROM users WHERE username=%s", (target_user,))
 
-    conn.commit()
+    c.close()
     conn.close()
 
-    # 修改：操作完毕后重定向回管理员面板
     return RedirectResponse(url="/secure/admin", status_code=303)
 
 
 if __name__ == "__main__":
-    # 自动获取云服务器分配的端口，找不到则默认 14283
     port = int(os.environ.get("PORT", 14283))
     print("启动服务器中...")
     uvicorn.run(app, host="0.0.0.0", port=port)
